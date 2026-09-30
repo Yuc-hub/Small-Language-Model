@@ -1,4 +1,4 @@
-"""Width-160 causal LM; experiment notes are kept here for run tracking.
+"""Width-160 causal LM; training objective is next-token prediction.
 
 # try01: SwiGLU
 # try02: width: 128 -> 160
@@ -8,7 +8,9 @@
 # try06: 增加 QK-RMSNorm 和门控
 # try07: 实现 8Q/4KV + 保留现有 QK-RMSNorm 和门控
 # try08: 10 Q / 5 KV
-# try09: Value Residual：后续层复用第 1 层的 Value；每头系数零初始化、可学习
+# try09: Value Residual：后续层复用第 1 层的 Value；验证 BPB 1.80584（本次记录配置为 4Q/4 层）
+# try10: Multi-Token Prediction：+2/+3 辅助预测头；验证 BPB 1.80300，try11 起撤销
+# try11: 移除 MTP，恢复单步 next-token 目标；训练端改为 Muon（矩阵）+ AdamW（其他参数）
 
 以上为实验记录；具体运行结果请与对应 run 目录中的指标一并记录。
 """
@@ -41,26 +43,14 @@ class Block(nn.Module):
         self.proj = nn.Linear(width, width)
         self.mlp = SwiGLU(width)
 
-    def forward(self, x, first_value=None):
+    def forward(self, x):
         batch, length, width = x.shape
         q, k, v = self.qkv(self.norm1(x)).view(
             batch, length, 3, self.heads, width // self.heads
         ).permute(2, 0, 3, 1, 4)
-        # Value Residual: later layers can reuse the first layer's value stream.
-        # A zero-initialized per-head coefficient keeps the starting model
-        # exactly equivalent to the original attention and lets training learn
-        # whether (and how strongly) the earlier features are useful.
-        if first_value is not None:
-            v = v + self.value_residual * first_value
         attended = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         x = x + self.proj(attended.transpose(1, 2).reshape(batch, length, width))
-        return x + self.mlp(self.norm2(x)), v
-
-    def add_value_residual(self, heads):
-        # One learned mixing weight per attention head, initialized to zero so
-        # the feature path is introduced gradually instead of perturbing the
-        # baseline at initialization.
-        self.value_residual = nn.Parameter(torch.zeros(1, heads, 1, 1))
+        return x + self.mlp(self.norm2(x))
 
 
 class GPT(nn.Module):
@@ -74,11 +64,6 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(
             [Block(width, config['heads']) for _ in range(config['depth'])]
         )
-        # Keep the first block as the source of an optional long-range value
-        # shortcut; block 0 itself has no shortcut, while deeper blocks learn
-        # independent per-head mixing strengths.
-        for block in self.blocks[1:]:
-            block.add_value_residual(config['heads'])
         self.norm = nn.LayerNorm(width)
         self.head = nn.Linear(width, config['vocab'], bias=False)
         self.apply(self.initialize)
@@ -94,13 +79,8 @@ class GPT(nn.Module):
     def features(self, ids):
         positions = torch.arange(ids.shape[1], device=ids.device)
         x = self.token(ids) + self.pos(positions)
-        first_value = None
-        for index, block in enumerate(self.blocks):
-            x, value = block(x, first_value if index > 0 else None)
-            if index == 0:
-                # Reuse the first layer's projected value tensor as a direct
-                # attention-value source in all subsequent layers.
-                first_value = value
+        for block in self.blocks:
+            x = block(x)
         return self.norm(x)
 
     def forward(self, ids):
@@ -113,4 +93,5 @@ class GPT(nn.Module):
 def build_model(config):
     model_config = dict(config)
     model_config['width'] = 160
+    model_config['depth'] = 12
     return GPT(model_config)

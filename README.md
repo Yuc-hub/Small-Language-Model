@@ -69,6 +69,60 @@ python evaluate.py --checkpoint runs/my-model/checkpoint.pt --split test
 
 Training writes `checkpoint.pt` and `metrics.json`. Evaluation writes `test_cpu_fp32.json` (or the corresponding device/split name) and per-window losses. Submit the **bpb** value from the complete-test JSON, not token perplexity or validation BPB. Default evaluation is FP32. Add `--device cuda` for GPU runs; training can use BF16, but ranked evaluation must use FP32 and remain reproducible on CPU. The supplied CUDA runner caps PyTorch allocation at 20 GB; driver overhead is additional.
 
+### Reproduce the current `Mymodel` experiment
+
+The following commands reproduce training and evaluation from a clean Python environment. If starting in the repository root, first enter `code/`; run the remaining commands from that directory. On macOS, install the CPU-capable PyTorch wheel from the default PyPI index:
+
+```bash
+cd code
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+On Linux or Windows CPU, the course-tested PyTorch wheel can instead be installed explicitly before the remaining requirements:
+
+```bash
+python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
+```
+
+Train the current `Mymodel` implementation on CPU with seed 17 for 2,000 steps:
+
+```bash
+python train.py \
+  --implementation Mymodel \
+  --device cpu \
+  --threads 4 \
+  --precision fp32 \
+  --seed 17 \
+  --steps 2000 \
+  --batch-size 32 \
+  --run-dir runs/mymodel-current
+```
+
+The trainer uses Muon for two-dimensional parameters inside Transformer blocks and AdamW for embeddings, normalization parameters and other vectors. It writes `runs/mymodel-current/checkpoint.pt` and `metrics.json`. Each run directory must be new or empty.
+
+Evaluate validation first while selecting the model, then freeze the implementation and checkpoint before the final test evaluation:
+
+```bash
+python evaluate.py \
+  --checkpoint runs/mymodel-current/checkpoint.pt \
+  --device cpu --threads 4 --precision fp32 --split validation \
+  --output runs/mymodel-current/validation_cpu_fp32.json
+
+# Run only after the model and all settings have been frozen.
+python evaluate.py \
+  --checkpoint runs/mymodel-current/checkpoint.pt \
+  --device cpu --threads 4 --precision fp32 --split test \
+  --output runs/mymodel-current/test_cpu_fp32.json
+```
+
+Use `bpb` from the complete-test JSON as the test score. The evaluator also records the checkpoint, implementation, evaluator and tokenizer hashes so the result can be tied to the exact artifacts.
+
+**Architecture/version note.** In the current checkout, `Mymodel.py` overrides the baseline configuration to width 160 and depth 12; the baseline JSON still says width 128 and depth 4, while the head count remains 4. Thus these commands describe the current 12-layer source, not the historical try11 run that reported about 1.602M parameters and used 4 layers. A checkpoint can only be evaluated with a matching model implementation. To reproduce historical try11, restore its exact source snapshot and verify the implementation hash recorded in its metrics before evaluating that checkpoint.
+
 ## 3. Files and model interface
 
 | Files | Use |

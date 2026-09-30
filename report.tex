@@ -1,0 +1,160 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+\usepackage[margin=2.1cm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,longtable,tabularx,array}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+\setlength{\parskip}{0.35em}
+\setlength{\parindent}{2em}
+\renewcommand{\arraystretch}{1.15}
+
+\title{面向 WikiText-2 的小型因果语言模型优化：方法、实验与批判性分析}
+\author{DASE7506 MP1 项目报告（实验记录整理稿）}
+\date{2026 年 9 月 30 日}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本报告总结 WikiText-2、固定 BPE-2048 分词器和 256-token 因果窗口上的小型自回归语言模型迭代实验，逐项整理 try01--try11 的模型改动、可获得的分数和对照解释。try11 在训练侧将 Transformer 块中的二维矩阵参数交给 Muon，其余参数交给 AdamW，并以标准下一 token 交叉熵训练；验证集 BPB 为 1.72253，处理训练目标 16.384M 个，训练用时约 816.5 秒。try01--try08 的结果显示数种结构迭代与改进信号，但早期运行记录的配置字段和 try 编号映射并不完整。报告因此将不能严格归因的结果标为探索性观察，并指出当前代码与已记录 try11 检查点之间存在深度配置不一致；解决复现问题前，不应把历史分数视为由当前源文件直接复现。
+\end{abstract}
+
+\noindent\textbf{关键词：}因果语言模型；WikiText-2；BPB；SwiGLU；Muon；AdamW；消融实验
+
+\section{研究问题与评估协议}
+本项目目标是在不使用预训练权重或外部训练文本的条件下，降低固定测试协议下的 bits per byte（BPB）。数据为课程提供的 WikiText-2 原始文本，分词器词表大小为 2048；训练和评分使用因果语言建模，评分窗口长度为 256。BPB 越低越好，测试集只用于冻结方法后的最终报告，不应用于选超参数。作业还限制 CPU 评分时间不超过基线的 5 倍、峰值评估内存不超过 4 GiB、未压缩推理资源不超过 64 MiB。
+
+BPB 以整个原始 UTF-8 字节数归一化负对数似然：
+\[
+  \mathrm{BPB}=\frac{-\sum_i \ln p(x_i\mid x_{<i})}{\ln 2\; B},
+\]
+其中 $B$ 为评估文本的 UTF-8 字节数。验证集含 376,599 个目标、1,148,007 字节；测试集含 428,405 个目标、1,292,013 字节。表中不同实验若处理目标数、模型规模或优化器不同，只能作为观察性比较，不能将分数差异归因于单一因素。
+
+\section{方法}
+\subsection{try11 的模型结构}
+按 try11 运行时的检查点规模和记录，模型采用宽度 $d=160$、深度 4、4 个查询头和 4 个 KV 头，即标准多头因果注意力（MHA），每头维度为 $160/4=40$。该版本不是 GQA。每个块为前置 LayerNorm、因果自注意力、残差连接、前置 LayerNorm 和 SwiGLU 前馈网络。SwiGLU 隐藏维度设为 $\lfloor 8d/3\rfloor=426$，使门控三投影 FFN 的权重规模接近常见 $4d$ GELU FFN；注意力通过 PyTorch 的因果 scaled dot-product attention 实现。输入使用可学习绝对位置嵌入，输出层与 token embedding 权重绑定。
+
+try08 是另一种结构：实验记录为宽度 160、深度 6、10 个 Q 头和 5 个 KV 头（GQA），并称保留 QK-RMSNorm 与门控。try08 与 try11 的头数、层数、注意力子模块和参数量均不同，故两者之间不是只改变优化器的对照。
+
+\subsection{try11 的混合优化器}
+try11 将名称以 \texttt{blocks.} 开头且为二维的参数矩阵分配给 Muon；token/position embedding、归一化参数及其他向量参数使用 AdamW。输出头与 token embedding 绑定，因此仍由 AdamW 更新。Muon 对动量矩阵执行五步 Newton--Schulz 多项式近似正交化，再更新权重；使用动量系数 0.95、权重衰减 0.1。AdamW 的学习率为 0.001、权重衰减为 0.1；Muon 学习率为 0.01。两组学习率共享 100 步 warmup 和 cosine 衰减，末值为各自峰值的 10\%。这种“矩阵参数用 Muon、embedding/向量参数用 AdamW”的分组与 Muon 常见适用范围一致，但小模型、CPU 和本课程数据上的收益仍需配对验证。Muon 的动量正交化思想可参见 Jordan 等人的方法说明\cite{muon}。
+
+训练目标恢复为单步因果交叉熵：
+\[
+  \mathcal{L}_{\mathrm{NTP}}=-\frac{1}{BT}\sum_{b,t}
+  \log p_\theta(x_{b,t+1}\mid x_{b,\le t}).
+\]
+try10 中使用的 +2/+3 token Multi-Token Prediction 辅助头已在 try11 移除。训练使用 seed 17、batch size 32、2000 步，每步 256 个目标，共处理 $2000\times32\times256=16{,}384{,}000$ 个目标。
+
+\section{实验结果}
+\subsection{try01--try11 逐轮比较}
+表\ref{tab:timeline} 按项目头部的 try 编号整理变更。早期 console 日志有若干次相同命令的重跑，且配置 JSON 有时仍显示基线宽度/头数；因此 try04--try07 的分数按对话中“变更—随后输出”的顺序暂配，try07 还存在重复日志。该映射用于实验回顾，不应替代带 checkpoint 哈希的正式运行表。BPB 越低越好；“未能确认”表示对话记录中没有可唯一关联到该 try 的分数。
+
+\begin{longtable}{@{}p{0.075\textwidth}p{0.31\textwidth}p{0.15\textwidth}p{0.16\textwidth}p{0.22\textwidth}@{}}
+\caption{try01--try11 逐轮变更及可确认的验证结果。}\label{tab:timeline}\\
+\toprule
+实验 & 改动记录 & 验证 BPB & 训练量 / 参数 & 对照解读 \\
+\midrule
+\endfirsthead
+\toprule
+实验 & 改动记录 & 验证 BPB & 训练量 / 参数 & 对照解读 \\
+\midrule
+\endhead
+try01 & SwiGLU；起始 Mymodel 记录 & 2.00814 & 9.830M；1.085M & 起始点；对应 checkpoint/run 名称未在片段中保存。 \\
+try02 & 宽度 128 $\to$ 160 & 1.73029 & 11.469M；2.194M & 1400 步记录；宽度覆盖和实际结构需以实现哈希核实。 \\
+try03 & 深度 4 $\to$ 6 & 未能确认 & 无可唯一关联的指标 & 结构改动有记录，但缺独立跑分，不能从后续结果反推。 \\
+try04 & RMSNorm 替换 LayerNorm & 1.75099$^\dagger$ & 11.469M；2.175M & 暂配日志；分数高于相邻可见记录不等于 RMSNorm 必然退化。 \\
+try05 & RoPE 替换绝对位置嵌入 & 1.73665$^\dagger$ & 11.469M；2.175M & 暂配日志；较 try04 低约 0.01434。 \\
+try06 & 增加 QK-RMSNorm 与注意力门控 & 1.72710$^\dagger$ & 11.469M；2.180M & 暂配日志；较 try05 低约 0.00955，但两个模块同时加入。 \\
+try07 & 8Q/4KV GQA，保留 QK-RMSNorm 与门控 & 1.73272$^\ddagger$ & 11.469M；2.028M & 暂配的一次重跑；另有 1.72710 日志及相同 checkpoint hash，映射不确定。 \\
+try08 & 10Q/5KV；记录为宽度 160、深度 6 & 1.72057 & 13.107M；2.030M & 目前最低验证 BPB；与 try07 训练量、配置并非严格一致。 \\
+try09 & Value Residual & 1.80584 & 16.384M；1.602M & 相比 try08 多训练目标但分数更高；模型规模/结构也不同。 \\
+try10 & +2/+3 token MTP 辅助损失 & 1.80300 & 16.384M；1.653M & 与 try09 近似训练预算；属于 VR 与 MTP 方案替换，非单因素消融。 \\
+try11 & 移除 MTP；块矩阵用 Muon、其余用 AdamW & 1.72253 & 16.384M；1.602M & 较 try10 低 0.08047，但同时改变目标和优化器。 \\
+\bottomrule
+\end{longtable}
+\noindent $^\dagger$ try04--try06 的编号关联按对话顺序重建；应对照原始 metrics.json 与 implementation/checkpoint 哈希复核。 $^\ddagger$ try07 曾有两组日志：BPB 1.72710 的记录与前一实验 checkpoint hash 一致，另一次 BPB 1.73272 的记录具有不同哈希；本文不把这两者混为同一可复现检查点。
+
+\subsection{测试集结果与关键验证指标}
+课程基线是指南给出的完整测试评估；try01 有完整测试分数；try02--try11 在目前提供的材料中均只有验证分数。未报告的测试分数标记为“未报告”，不以验证 BPB 替代。
+
+\begin{table}[htbp]
+\centering\small
+\caption{实验结果。BPB 越低越好；模型结构按运行记录描述。}
+\label{tab:results}
+\begin{tabularx}{\textwidth}{@{}l X r r r r@{}}
+\toprule
+实验 & 主要设置 & 参数量 & 训练目标数 & 验证 BPB & 测试 BPB \\
+\midrule
+课程基线 & GPT，$d=128$，4 层，4 头；指南报告 & 1.088M & 9.830M（标准配方） & 未报告 & 2.10127 \\
+try01 & SwiGLU 早期版本；1200 步 & 1.450M & 9.830M & 1.81919 & 1.85213 \\
+try08 & $d=160$，6 层，10Q/5KV；GQA 实验记录 & 2.030M & 13.107M & 1.72057 & 未报告 \\
+try09 & Value Residual；报告配置为 4 头/4 层 & 1.602M & 16.384M & 1.80584 & 未报告 \\
+try10 & +2/+3 MTP 辅助头 & 1.653M & 16.384M & 1.80300 & 未报告 \\
+try11 & 移除 MTP；Muon（块矩阵）+ AdamW & 1.602M & 16.384M & 1.72253 & 未报告 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+try11 相比 try10 的验证 BPB 低 0.08047，训练时间从 1078.8 秒降至 816.5 秒，参数量减少约 51.2K。由于这次同时撤销了 MTP 并改变了优化器，不能把 BPB 改善单独归因于 Muon，也不能断言 MTP 有害。try09 与 try10 的结果接近（1.80584 与 1.80300），但两者是在 Value Residual 和 MTP 间替换设计，仍不是严格单因素消融。try04--try07 的数值趋势（1.75099、1.73665、1.72710、1.73272）可用来提出后续假设，但编号映射和代码哈希需要从原始运行目录复核后才适合做定量因果解释。
+
+try11 与 try08 的验证 BPB 相差约 0.00196，表面上几乎持平；try11 参数更少，但 try08 的模型更深、头设计不同，处理目标数也更少。该对比只支持“这些已运行配置在各自训练方案下得到相近的验证分数”，不支持“Muon 优于 GQA”或“较浅模型等效于较深模型”。
+
+\subsection{训练动态与测试证据}
+try11 的训练交叉熵从第 100 步的 5.650 下降到第 2000 步的 3.327，中途在第 1700 步附近有短暂回升，随后再次下降。该曲线说明训练仍在学习，但它不是验证曲线，不能据此判定过拟合或最佳停止点。try01 是目前给出的唯一学生模型完整测试记录：测试 BPB 1.85213，相对课程基线 2.10127 低约 11.9\%。try11 尚无测试 BPB；因此，不能将 try11 的验证分数写成最终榜单分数，也不能由验证结果推断严格测试改进幅度。
+
+\section{对照实验与消融设计评估}
+课程要求包含相同训练目标数的对照和核心机制消融。try09、try10、try11 都训练了 16.384M 个目标，try02、try04--try07 的可见记录均为 11.469M 左右，满足“目标数相同”这一必要条件；但后者的 run id/实现哈希需复核，且 try06 同时加入两个注意力机制。目标数相同并不足以构成单因素实验。try08 的训练目标数为 13.107M，也无法与 16.384M 的实验作等预算因果比较。
+
+\begin{table}[htbp]
+\centering\small
+\caption{现有对照的可解释性与仍缺少的配对实验。}
+\label{tab:ablations}
+\begin{tabularx}{\textwidth}{@{}l X X@{}}
+\toprule
+问题 & 当前证据 & 结论边界 / 建议补充 \\
+\midrule
+MTP 是否有帮助？ & try10 BPB 1.80300，try11 BPB 1.72253；两者均为 16.384M 目标。 & try11 同时换了 Muon/AdamW，因此混杂。用同一模型、seed、步数与优化器，比较 MTP 开/关。 \\
+Value Residual 是否有帮助？ & try09 BPB 1.80584；try10 BPB 1.80300。 & 模块被替换且参数量、训练损耗形式变化；用 try09 基线分别开/关 VR，保持其他因素固定。 \\
+Muon 是否优于 AdamW？ & try11 使用混合优化器，验证 BPB 1.72253。 & 没有相同架构、相同学习率日程下的 AdamW 配对组。新增 AdamW-only 对照；其余训练随机性和数据顺序固定。 \\
+深度/注意力配置影响？ & try08（6 层、10Q/5KV）与 try11（4 层、4Q/4KV）验证分数接近。 & 多因素同时变化；对宽度、头数、QK norm、门控与深度分别做配对消融。 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+一个更有判别力的最低成本方案是：固定 try11 的架构、seed、训练 token 数及学习率日程，运行 AdamW-only 和 Muon+AdamW 两组；然后只在混合优化器条件下比较 Muon 学习率 0.005 与 0.01。若要评估层数，应单独比较 4 层与 6 层，并将实际模型配置写入 checkpoint 元数据。所有模型先按验证集选择，最后只对冻结配置运行测试集。
+
+\section{批判性分析}
+\paragraph{优化收益有初步信号，但证据不足。} try11 的验证分数相较 try10 明显更低，同时训练耗时也减少约 24\%。但由于撤销 MTP 与优化器切换同时发生，观察到的变化不能拆分成“Muon 效果”与“移除 MTP 效果”。Muon 文献中的矩阵更新机制为该分组提供了方法动机\cite{muon}，不构成它在本任务上必然有效的保证。
+
+\paragraph{实验记录暴露配置和源代码不一致。} try11 指标 JSON 保存的原始配置写着宽度 128、深度 4、4 头，而模型工厂将宽度覆盖为 160；参数量 1,601,600 与宽度 160、深度 4 的当前结构相符。可是报告撰写时工作区的 \texttt{Mymodel.py} 又将深度强制设为 12。当前 12 层源文件与 try11 的参数量及已记录实现哈希不一致，不能直接用于复现该检查点。最终提交前必须恢复与 try11 检查点匹配的源代码，或用当前源代码重新训练，并将实际宽度、深度、Q/KV 头数写入运行配置和报告。
+
+\paragraph{元数据应反映实际模型。} 运行报告中的 \texttt{width=128} 并非有效宽度；宽度被模型工厂覆盖会使不同实验的自动配置表产生歧义。推荐在构造模型时更新实际配置，另外记录 \texttt{q\_heads} 与 \texttt{kv\_heads}，而不是把单个 \texttt{heads} 字段用于描述 GQA。
+
+\paragraph{训练与评测成本尚未完整。} try11 报告训练 816.5 秒、验证评分 8.42 秒，但没有相匹配的全测试评分、峰值 RAM 和推理资源包大小。训练时间本身不等于评估合规性；提交前还需用冻结 checkpoint 在 CPU FP32 下测完整 test BPB、评分耗时、峰值内存和未压缩资产体积。
+
+\paragraph{机制选择应围绕小规模数据和预算。} GQA 主要减少 K/V 头和相关推理状态；在本项目固定 256-token 独立窗口、小模型 CPU 评测下，其长上下文缓存优势未必转化为 BPB 收益。SwiGLU 是前馈层的门控结构，已有研究考察了其在 Transformer FFN 中的效果\cite{swiglu}；GQA 的定义则是多个 Query 头共享较少的 KV 头\cite{gqa}。这些机制都需要在本项目自己的同预算对照中验证，而不能仅凭大型模型或不同训练配方的结果外推。
+
+\section{结论}
+在已有验证记录中，try11 的 Muon+AdamW、单步 next-token 配置达到 BPB 1.72253，是目前与 try10 同训练目标数实验中分数最低的一组，且训练速度较快。但由于 MTP 与优化器同时变化，且 try08 的模型结构/训练预算不同，这些结果尚不能识别各机制的独立因果贡献。try11 没有完整测试分数；此外，当前工作区的 12 层源代码与 try11 检查点参数量不符。下一步应优先恢复/冻结可复现源代码，完成相同架构下 Muon+AdamW 对 AdamW 的配对比较，再做独立的学习率或深度消融，最后在冻结模型上运行正式测试。
+
+\section*{参考文献}
+\begin{thebibliography}{9}
+\bibitem{swiglu}
+N. Shazeer. \emph{GLU Variants Improve Transformer}. arXiv:2002.05202, 2020.\
+\url{https://arxiv.org/abs/2002.05202}
+
+\bibitem{gqa}
+J. Ainslie et al. \emph{GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints}. EMNLP, 2023.\
+\url{https://arxiv.org/abs/2305.13245}
+
+\bibitem{muon}
+K. Jordan et al. \emph{Muon: An optimizer for hidden layers in neural networks}. Technical note and implementation, 2024.\
+\url{https://kellerjordan.github.io/posts/muon/}
+
+\bibitem{gpt}
+A. Vaswani et al. \emph{Attention Is All You Need}. NeurIPS, 2017.\
+\url{https://arxiv.org/abs/1706.03762}
+\end{thebibliography}
+
+\end{document}
