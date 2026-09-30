@@ -93,5 +93,5 @@ class GPT(nn.Module):
 def build_model(config):
     model_config = dict(config)
     model_config['width'] = 160
-    model_config['depth'] = 12
+    model_config['depth'] = 8
     return GPT(model_config)

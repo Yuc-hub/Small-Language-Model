@@ -69,59 +69,80 @@ python evaluate.py --checkpoint runs/my-model/checkpoint.pt --split test
 
 Training writes `checkpoint.pt` and `metrics.json`. Evaluation writes `test_cpu_fp32.json` (or the corresponding device/split name) and per-window losses. Submit the **bpb** value from the complete-test JSON, not token perplexity or validation BPB. Default evaluation is FP32. Add `--device cuda` for GPU runs; training can use BF16, but ranked evaluation must use FP32 and remain reproducible on CPU. The supplied CUDA runner caps PyTorch allocation at 20 GB; driver overhead is additional.
 
-### Reproduce the current `Mymodel` experiment
+### Final model artifact: `runs/student/`
 
-The following commands reproduce training and evaluation from a clean Python environment. If starting in the repository root, first enter `code/`; run the remaining commands from that directory. On macOS, install the CPU-capable PyTorch wheel from the default PyPI index:
+Section 1 contains the complete Python 3.12 environment setup and pinned dependencies. Run the commands below from `code/`. The final deliverable is stored in `runs/student/`. The current final run is named `try13`; after it finishes, stage its checkpoint and training metrics in that canonical directory. The training command below mirrors the last completed recipe (seed 17, 2,000 steps, batch size 32); if try13 used different arguments, use the exact values in its `metrics.json` when reproducing it.
 
-```bash
-cd code
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-On Linux or Windows CPU, the course-tested PyTorch wheel can instead be installed explicitly before the remaining requirements:
-
-```bash
-python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -r requirements.txt
-```
-
-Train the current `Mymodel` implementation on CPU with seed 17 for 2,000 steps:
+To train the final architecture from scratch in a new run directory:
 
 ```bash
 python train.py \
-  --implementation Mymodel \
-  --device cpu \
-  --threads 4 \
-  --precision fp32 \
-  --seed 17 \
-  --steps 2000 \
-  --batch-size 32 \
-  --run-dir runs/mymodel-current
+  --implementation student \
+  --device cpu --threads 4 --precision fp32 \
+  --seed 17 --steps 2000 --batch-size 32 \
+  --run-dir runs/try13-reproduction
 ```
 
-The trainer uses Muon for two-dimensional parameters inside Transformer blocks and AdamW for embeddings, normalization parameters and other vectors. It writes `runs/mymodel-current/checkpoint.pt` and `metrics.json`. Each run directory must be new or empty.
+When the final try13 run is complete, copy its checkpoint and metrics into `runs/student`. On macOS/Linux:
 
-Evaluate validation first while selecting the model, then freeze the implementation and checkpoint before the final test evaluation:
+```bash
+mkdir -p runs/student
+cp runs/try13/checkpoint.pt runs/student/checkpoint.pt
+cp runs/try13/metrics.json runs/student/metrics.json
+```
+
+On Windows PowerShell:
+
+```powershell
+New-Item -ItemType Directory -Force runs/student
+Copy-Item runs/try13/checkpoint.pt runs/student/checkpoint.pt
+Copy-Item runs/try13/metrics.json runs/student/metrics.json
+```
+
+Before copying, confirm that `runs/try13/metrics.json` says `"implementation": "student"`. The checkpoint stores this module name. Moving or renaming the run directory does not change it; a checkpoint still labeled `Mymodel` will not load through `--implementation student` unless it is migrated with matching source code.
+
+Keep the exact `student.py` and support files used to train the checkpoint. Reproduce validation if needed, then run the final test evaluation only after freezing the model and settings:
 
 ```bash
 python evaluate.py \
-  --checkpoint runs/mymodel-current/checkpoint.pt \
+  --checkpoint runs/student/checkpoint.pt \
   --device cpu --threads 4 --precision fp32 --split validation \
-  --output runs/mymodel-current/validation_cpu_fp32.json
+  --output runs/student/validation_cpu_fp32.json
 
-# Run only after the model and all settings have been frozen.
 python evaluate.py \
-  --checkpoint runs/mymodel-current/checkpoint.pt \
+  --checkpoint runs/student/checkpoint.pt \
   --device cpu --threads 4 --precision fp32 --split test \
-  --output runs/mymodel-current/test_cpu_fp32.json
+  --output runs/student/test_cpu_fp32.json
 ```
 
-Use `bpb` from the complete-test JSON as the test score. The evaluator also records the checkpoint, implementation, evaluator and tokenizer hashes so the result can be tied to the exact artifacts.
+The final `runs/student/` directory should contain `checkpoint.pt`, the original training `metrics.json`, validation/test evaluation JSON files, and the generated per-window NLL file. The full-test score is the `bpb` field in `test_cpu_fp32.json`. Compare the `checkpoint_sha256` and `implementation_sha256` fields in the training metrics and evaluation JSON. A different implementation hash means the source changed; restore the training-time source before claiming exact reproduction. The evaluator JSON also records evaluator and tokenizer hashes.
 
-**Architecture/version note.** In the current checkout, `Mymodel.py` overrides the baseline configuration to width 160 and depth 12; the baseline JSON still says width 128 and depth 4, while the head count remains 4. Thus these commands describe the current 12-layer source, not the historical try11 run that reported about 1.602M parameters and used 4 layers. A checkpoint can only be evaluated with a matching model implementation. To reproduce historical try11, restore its exact source snapshot and verify the implementation hash recorded in its metrics before evaluating that checkpoint.
+For a peer or clean-environment reproduction, run the same frozen checkpoint with the supplied evaluator:
+
+```bash
+python evaluate.py --checkpoint runs/student/checkpoint.pt \
+  --device cpu --threads 4 --precision fp32 --split test \
+  --output runs/student/peer-test.json
+```
+
+Run this check after evaluation to verify the checkpoint and model source match the training record and print the reproduced test BPB:
+
+```bash
+python - <<'PY'
+import json
+
+train = json.load(open('runs/student/metrics.json'))
+result = json.load(open('runs/student/test_cpu_fp32.json'))
+for key in ('checkpoint_sha256', 'implementation_sha256'):
+    matched = train[key] == result[key]
+    print(f'{key}: {matched}')
+    if not matched:
+        raise SystemExit(f'{key} mismatch; this is not an exact reproduction')
+print('reproduced test BPB:', result['bpb'])
+PY
+```
+
+**Architecture/version note.** `student.py` sets width 160 and depth 12 inside `build_model`; the baseline JSON still says width 128 and depth 4, while the head count remains 4. Effective architecture comes from the exact `student.py` used by try13, not the baseline JSON. When try13 finishes, record its actual depth, parameter count, training arguments, checkpoint hash and implementation hash here. Historical try11 used a different four-layer source and cannot be substituted for the final checkpoint.
 
 ## 3. Files and model interface
 
@@ -180,3 +201,7 @@ Compare reproduced BPB with the reported score. Submit **Peer Review Report** wi
 WikiText-2 was introduced by Stephen Merity, Caiming Xiong, James Bradbury and Richard Socher in [Pointer Sentinel Mixture Models](https://arxiv.org/abs/1609.07843). The text is by Wikipedia contributors. The [upstream dataset](https://huggingface.co/datasets/Salesforce/wikitext) identifies [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/) and the [GNU Free Documentation License](https://www.gnu.org/licenses/fdl-1.3.html); retain these notices when redistributing the data.
 
 The supplied `wikitext-2-raw-v1` splits preserve revision `b08601e04326c79dfdd32d625aee71d232d685c3`. Rows are joined with newlines and encoded as UTF-8; the tokenizer is fitted only to training text. Dataset hashes are in `data/manifest.json`. These dataset notices do not assign a new license to the surrounding classroom code.
+
+## AI assistance disclosure
+
+OpenAI Codex assisted with reviewing the coursework code, discussing and implementing model/training experiments (including SwiGLU, Value Residual, Multi-Token Prediction, and the Muon + AdamW training path), interpreting experiment logs, and drafting the research report and reproduction instructions. The student selected the experiments, ran the reported training/evaluation commands, supplied the resulting metrics, and is responsible for understanding and verifying the submitted implementation and results. Codex did not run the reported training runs or use the test split to select model settings.

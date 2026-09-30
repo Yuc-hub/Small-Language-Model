@@ -107,7 +107,7 @@ def main():
     # orthogonalized matrix updates are intended; keep embeddings, norms, and
     # other vectors on AdamW. The tied output head is the same token embedding
     # parameter and therefore also stays on AdamW.
-    if args.implementation.lower() == 'mymodel':
+    if args.implementation.lower() == 'student':
         muon_parameters, adamw_parameters = [], []
         for name, parameter in model.named_parameters():
             if name.startswith('blocks.') and parameter.ndim == 2:
